@@ -17,8 +17,8 @@ use std::{
     future::Future,
     marker::PhantomData,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -32,12 +32,12 @@ use foyer_common::{
     error::{Error, ErrorKind, Result},
     metrics::Metrics,
     properties::{Age, Properties},
-    spawn::Spawner,
+    spawn::{SpawnHandle, Spawner},
 };
 use futures_core::future::BoxFuture;
 use futures_util::{
     FutureExt,
-    future::{join_all, try_join_all},
+    future::{Shared, join_all, try_join_all},
 };
 use itertools::Itertools;
 
@@ -379,7 +379,6 @@ where
             Arc::new(self.reinsertion_filter),
             self.blob_index_size,
             device.statistics().clone(),
-            runtime.clone(),
         );
         let reclaimer: Arc<dyn ReclaimerTrait> = Arc::new(reclaimer);
 
@@ -421,8 +420,9 @@ where
         .await?;
 
         let io_buffer_size = self.buffer_pool_size / self.flushers;
+        let mut workers = Vec::with_capacity(flushers.len());
         for (flusher, rx) in flushers.iter().zip(rxs) {
-            flusher.run(
+            workers.push(flusher.run(
                 rx,
                 block_size,
                 io_buffer_size,
@@ -435,7 +435,7 @@ where
                 &runtime,
                 #[cfg(any(test, feature = "test_utils"))]
                 self.flush_switch.clone(),
-            )?;
+            )?);
         }
 
         let admission_filter = self.admission_filter.with_condition(IoThrottle);
@@ -450,7 +450,11 @@ where
             submit_queue_size_threshold: self.submit_queue_size_threshold,
             sequence,
             _spawner: runtime,
-            active: AtomicBool::new(true),
+            lifecycle: Mutex::new(Lifecycle {
+                active: true,
+                workers,
+                close: None,
+            }),
             metrics,
             #[cfg(any(test, feature = "test_utils"))]
             flush_switch: self.flush_switch,
@@ -529,7 +533,7 @@ where
 
     _spawner: Spawner,
 
-    active: AtomicBool,
+    lifecycle: Mutex<Lifecycle>,
 
     metrics: Arc<Metrics>,
 
@@ -538,6 +542,14 @@ where
 
     #[cfg(any(test, feature = "test_utils"))]
     load_holder: Holder,
+}
+
+type CloseFuture = Shared<BoxFuture<'static, std::result::Result<(), Arc<Error>>>>;
+
+struct Lifecycle {
+    active: bool,
+    workers: Vec<SpawnHandle<Result<()>>>,
+    close: Option<CloseFuture>,
 }
 
 impl<K, V, P> Clone for BlockEngine<K, V, P>
@@ -569,18 +581,54 @@ where
     }
 
     fn close(&self) -> BoxFuture<'static, Result<()>> {
-        let this = self.clone();
+        let mut lifecycle = self.inner.lifecycle.lock().unwrap();
+        if lifecycle.close.is_none() {
+            // Serialize admission with the shutdown boundary. The spawned task,
+            // not any individual caller, owns shutdown if a close is cancelled.
+            lifecycle.active = false;
+            let workers = std::mem::take(&mut lifecycle.workers);
+            let this = self.clone();
+            let task = self.inner._spawner.spawn(async move {
+                loop {
+                    let generation = this.inner.block_manager.reclaim_generation();
+                    this.wait().await;
+                    // Reclaimers enqueue reinsertion after the first flush fence.
+                    join_all(this.inner.flushers.iter().map(|flusher| flusher.wait())).await;
+                    if this.inner.block_manager.reclaim_is_quiescent(generation) {
+                        break;
+                    }
+                }
+                for flusher in &this.inner.flushers {
+                    flusher.submit(Submission::Stop);
+                }
+                // Join every worker even if one fails; returning early would
+                // release the caller while another worker still owns buffers.
+                let results = join_all(workers).await;
+                drop(this);
+                for result in results {
+                    result??;
+                }
+                Ok(())
+            });
+            lifecycle.close = Some(
+                async move { task.await.and_then(|result| result).map_err(Arc::new) }
+                    .boxed()
+                    .shared(),
+            );
+        }
+        let close = lifecycle.close.as_ref().unwrap().clone();
         async move {
-            this.inner.active.store(false, Ordering::Relaxed);
-            this.wait().await;
-            Ok(())
+            close
+                .await
+                .map_err(|error| Error::new(ErrorKind::Join, "block engine shutdown failed").with_source(error))
         }
         .boxed()
     }
 
     #[cfg_attr(feature = "tracing", trace(name = "foyer::storage::engine::block::engine::enqueue"))]
     fn enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) {
-        if !self.inner.active.load(Ordering::Relaxed) {
+        let lifecycle = self.inner.lifecycle.lock().unwrap();
+        if !lifecycle.active {
             tracing::warn!("cannot enqueue new entry after closed");
             return;
         }
@@ -731,7 +779,8 @@ where
     }
 
     fn delete(&self, hash: u64) {
-        if !self.inner.active.load(Ordering::Relaxed) {
+        let lifecycle = self.inner.lifecycle.lock().unwrap();
+        if !lifecycle.active {
             tracing::warn!("cannot delete entry after closed");
             return;
         }
@@ -761,17 +810,20 @@ where
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
         let this = self.clone();
         async move {
-            if !this.inner.active.load(Ordering::Relaxed) {
-                return Err(Error::new(ErrorKind::Closed, "cannot delete entry after closed"));
+            {
+                let lifecycle = this.inner.lifecycle.lock().unwrap();
+                if !lifecycle.active {
+                    return Err(Error::new(ErrorKind::Closed, "cannot delete entry after closed"));
+                }
+
+                // Write a tombstone to clear tombstone log by increase the max sequence.
+                let sequence = this.inner.sequence.fetch_add(1, Ordering::Relaxed);
+
+                this.inner.flushers[0].submit(Submission::Tombstone {
+                    tombstone: Tombstone { hash: 0, sequence },
+                    stats: None,
+                });
             }
-
-            // Write a tombstone to clear tombstone log by increase the max sequence.
-            let sequence = this.inner.sequence.fetch_add(1, Ordering::Relaxed);
-
-            this.inner.flushers[0].submit(Submission::Tombstone {
-                tombstone: Tombstone { hash: 0, sequence },
-                stats: None,
-            });
             this.wait().await;
 
             // Clear indices.

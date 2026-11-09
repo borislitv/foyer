@@ -34,7 +34,7 @@ use foyer_common::{
     error::{Error, Result},
     metrics::Metrics,
     properties::Properties,
-    spawn::Spawner,
+    spawn::{SpawnHandle, Spawner},
 };
 use futures_core::future::BoxFuture;
 use futures_util::{
@@ -83,6 +83,7 @@ where
     Wait {
         tx: oneshot::Sender<()>,
     },
+    Stop,
 }
 
 impl<K, V, P> Debug for Submission<K, V, P>
@@ -112,6 +113,7 @@ where
                 f.debug_struct("Reinsertion").field("reinsertion", reinsertion).finish()
             }
             Self::Wait { .. } => f.debug_struct("Wait").finish(),
+            Self::Stop => f.debug_struct("Stop").finish(),
         }
     }
 }
@@ -181,7 +183,7 @@ where
         metrics: Arc<Metrics>,
         spawner: &Spawner,
         #[cfg(any(test, feature = "test_utils"))] flush_switch: Switch,
-    ) -> Result<()> {
+    ) -> Result<SpawnHandle<Result<()>>> {
         let id = self.id;
         let io_buffer_size = bits::align_down(PAGE, io_buffer_size);
         assert!(io_buffer_size > 0);
@@ -221,17 +223,12 @@ where
             io_tasks: VecDeque::with_capacity(1),
             current_block_handle,
             max_entry_size,
+            stopping: false,
             #[cfg(any(test, feature = "test_utils"))]
             flush_switch,
         };
 
-        spawner.spawn(async move {
-            if let Err(e) = runner.run().await {
-                tracing::error!(id, "[flusher]: flusher exit with error: {e}");
-            }
-        });
-
-        Ok(())
+        Ok(spawner.spawn(runner.run()))
     }
 
     pub fn submit(&self, submission: Submission<K, V, P>) {
@@ -322,6 +319,7 @@ where
     io_tasks: VecDeque<BoxFuture<'static, IoTaskCtx<K, V, P>>>,
 
     max_entry_size: usize,
+    stopping: bool,
 
     #[cfg(any(test, feature = "test_utils"))]
     flush_switch: Switch,
@@ -362,6 +360,12 @@ where
                 || !self.tombstone_infos.is_empty();
             let no_io_task = self.io_tasks.is_empty();
 
+            // A stop is sent only after reclamation and its reinsertions are
+            // quiescent. Finish all accepted I/O before releasing the runner.
+            if self.stopping && !need_flush && no_io_task {
+                break;
+            }
+
             if can_flush && need_flush && no_io_task {
                 let (io_buffer, infos) = self.buffer.take().unwrap().finish();
 
@@ -396,7 +400,7 @@ where
                     // `try_into_io_buffer` must return `Some(..)` here.
                     self.rotate_buffer = io_slice.try_into_io_slice_mut();
                 }
-                Ok(submission) = rx.recv() => {
+                Ok(submission) = rx.recv(), if !self.stopping => {
                     self.recv(submission);
                 }
                 // Graceful shutdown.
@@ -455,6 +459,7 @@ where
                 }
             }
             Submission::Wait { tx } => self.waiters.push(tx),
+            Submission::Stop => self.stopping = true,
         }
     }
 

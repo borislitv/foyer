@@ -19,11 +19,9 @@ use foyer_common::{
     code::{StorageKey, StorageValue},
     error::Result,
     properties::Properties,
-    spawn::Spawner,
 };
 use futures_core::future::BoxFuture;
-use futures_util::{FutureExt, future::join_all};
-use itertools::Itertools;
+use futures_util::FutureExt;
 
 use crate::{
     Statistics, StorageFilter,
@@ -55,7 +53,6 @@ where
     reinsertion_filter: Arc<StorageFilter>,
     blob_index_size: usize,
     statistics: Arc<Statistics>,
-    spawner: Spawner,
 }
 
 impl<K, V, P> Debug for Reclaimer<K, V, P>
@@ -81,7 +78,6 @@ where
         reinsertion_filter: Arc<StorageFilter>,
         blob_index_size: usize,
         statistics: Arc<Statistics>,
-        spawner: Spawner,
     ) -> Self {
         Self {
             indexer,
@@ -89,7 +85,6 @@ where
             reinsertion_filter,
             blob_index_size,
             statistics,
-            spawner,
         }
     }
 }
@@ -105,7 +100,6 @@ where
         let statistics = self.statistics.clone();
         let blob_index_size = self.blob_index_size;
         let flushers = self.flushers.clone();
-        let spawner = self.spawner.clone();
         let indexer = self.indexer.clone();
         async move {
             let id = block.id();
@@ -165,10 +159,12 @@ where
 
             let unpicked_count = unpicked.len();
 
-            let waits = flushers.iter().map(|flusher| flusher.wait()).collect_vec();
-            spawner.spawn(async move {
-                join_all(waits).await;
-            });
+            // Enqueue flush fences before returning the reclaimed block. Do not
+            // await them here: a flusher may need this very block to progress.
+            // Engine shutdown drains these fences and any reclamation they start.
+            for flusher in &flushers {
+                drop(flusher.wait());
+            }
             indexer.remove_batch(unpicked);
 
             if let Err(e) = BlockCleaner::clean(&block).await {

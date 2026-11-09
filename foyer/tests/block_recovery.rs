@@ -28,6 +28,7 @@ use foyer::{
     BlockEngineConfig, DefaultHasher, DeviceBuilder, FileDeviceBuilder, HybridCache, HybridCacheBuilder, RecoverMode,
     Statistics, StorageFilter, StorageFilterCondition, StorageFilterResult,
 };
+use futures_util::FutureExt as _;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -46,6 +47,14 @@ impl StorageFilterCondition for KeepOne {
 }
 
 async fn open(directory: &Path, keep: Option<u64>) -> HybridCache<u64, Vec<u8>> {
+    open_with_switch(directory, keep, foyer_storage::test_utils::Switch::default()).await
+}
+
+async fn open_with_switch(
+    directory: &Path,
+    keep: Option<u64>,
+    flush_switch: foyer_storage::test_utils::Switch,
+) -> HybridCache<u64, Vec<u8>> {
     HybridCacheBuilder::new()
         .memory(1)
         .storage()
@@ -64,6 +73,7 @@ async fn open(directory: &Path, keep: Option<u64>) -> HybridCache<u64, Vec<u8>> 
             .with_reclaimers(1)
             .with_recover_concurrency(1)
             .with_indexer_shards(4)
+            .with_flush_switch(flush_switch)
             .with_reinsertion_filter(
                 StorageFilter::new().with_condition(KeepOne(keep.map(|key| DefaultHasher::default().hash_one(key)))),
             ),
@@ -214,4 +224,118 @@ async fn recovered_full_cache_resumes_writing() {
     })
     .await
     .expect("full-cache recovery must complete");
+}
+
+#[tokio::test]
+async fn close_joins_idle_workers_and_releases_file_owners() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = open(directory.path(), None).await;
+        let partition = cache.storage().device().unwrap().partition(0);
+        let owner = Arc::downgrade(&partition);
+        drop(partition);
+        drop(cache.writer(1).storage().insert(b"completed".to_vec()));
+        cache.close().await.unwrap();
+        drop(cache);
+        assert!(
+            owner.upgrade().is_none(),
+            "idle workers must not retain a closed cache's files and buffers"
+        );
+    })
+    .await
+    .expect("close must join owned work");
+}
+
+#[tokio::test]
+async fn cancelled_and_concurrent_close_join_the_same_work() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let directory = tempfile::tempdir().unwrap();
+        let switch = foyer_storage::test_utils::Switch::default();
+        switch.on();
+        let cache = open_with_switch(directory.path(), None, switch.clone()).await;
+        let owner = Arc::downgrade(&cache.storage().device().unwrap().partition(0));
+        drop(cache.writer(1).storage().insert(b"pending".to_vec()));
+
+        // Poll, then cancel, both public shutdown layers while a real file
+        // flush is held. Cancellation must not turn "started" into "finished".
+        let mut first = Box::pin(cache.close());
+        assert!(first.as_mut().now_or_never().is_none());
+        drop(first);
+        let mut storage_first = Box::pin(cache.storage().close());
+        assert!(storage_first.as_mut().now_or_never().is_none());
+        drop(storage_first);
+
+        let mut second = Box::pin(cache.close());
+        let mut third = Box::pin(cache.close());
+        let mut storage_second = Box::pin(cache.storage().close());
+        assert!(
+            second.as_mut().now_or_never().is_none(),
+            "close must join an earlier cancelled close"
+        );
+        assert!(
+            third.as_mut().now_or_never().is_none(),
+            "concurrent close must not return early"
+        );
+        assert!(storage_second.as_mut().now_or_never().is_none());
+        assert!(owner.upgrade().is_some(), "pending I/O must retain file ownership");
+
+        switch.off();
+        // Switch is an existing polling test utility; enqueue a fence to wake
+        // the runner after releasing it, rather than relying on a sleep.
+        cache.storage().wait().await;
+        second.await.unwrap();
+        third.await.unwrap();
+        storage_second.await.unwrap();
+        cache.close().await.unwrap();
+        cache.storage().close().await.unwrap();
+        drop(cache);
+        assert!(owner.upgrade().is_none());
+
+        let cache = open(directory.path(), None).await;
+        assert_eq!(
+            cache.storage().load(&1).await.unwrap().kv(),
+            Some((1, b"pending".to_vec()))
+        );
+        cache.close().await.unwrap();
+    })
+    .await
+    .expect("cancelled and concurrent close must complete");
+}
+
+#[tokio::test]
+async fn close_drains_reinsertions_from_final_reclamation() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        // End the last write at different positions around the first region
+        // reuse. In particular, do not call wait after that write: close must
+        // drain the reclamation and reinsertion it initiates itself.
+        for final_key in 100..120_u64 {
+            let directory = tempfile::tempdir().unwrap();
+            let cache = open(directory.path(), Some(0)).await;
+            let owner = Arc::downgrade(&cache.storage().device().unwrap().partition(0));
+            for key in 0..=final_key {
+                drop(cache.writer(key).storage().insert(vec![(key % 251) as u8; 128 * KIB]));
+                if key != final_key {
+                    cache.storage().wait().await;
+                }
+            }
+            cache.close().await.unwrap();
+            drop(cache);
+            assert!(
+                owner.upgrade().is_none(),
+                "reclaim workers retained files at final key {final_key}"
+            );
+
+            let cache = open(directory.path(), None).await;
+            for key in [0, final_key] {
+                assert_eq!(
+                    cache.storage().load(&key).await.unwrap().kv(),
+                    Some((key, vec![(key % 251) as u8; 128 * KIB])),
+                    "close lost a completed/reinserted entry at final key {final_key}"
+                );
+            }
+            cache.close().await.unwrap();
+        }
+    })
+    .await
+    .expect("close must drain final reclamation");
 }
