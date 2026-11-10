@@ -18,10 +18,11 @@ use itertools::Itertools;
 use super::indexer::EntryAddress;
 use crate::{
     engine::block::{
-        buffer::{BlobGeneration, BlobIndexReader},
+        buffer::{BlobEntryIndex, BlobGeneration, BlobIndexReader},
         manager::Block,
+        serde::EntryHeader,
     },
-    io::bytes::IoSliceMut,
+    io::{PAGE, bytes::IoSliceMut},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -54,7 +55,13 @@ impl BlockScanner {
     }
 
     pub async fn next(&mut self) -> Result<Option<Vec<EntryInfo>>> {
-        if self.finished || self.offset as usize + self.blob_index_size > self.block.size() {
+        if self.finished
+            || self
+                .offset
+                .checked_add(self.blob_index_size as u64)
+                .is_none_or(|end| end > self.block.size() as u64)
+        {
+            self.finished = true;
             return Ok(None);
         }
 
@@ -68,6 +75,7 @@ impl BlockScanner {
                     block_id = self.block.id(),
                     "[block blob scanner]: cannot parse a blob, skip the remaining block"
                 );
+                self.finished = true;
                 return Ok(None);
             }
         };
@@ -82,10 +90,16 @@ impl BlockScanner {
         self.generation = Some(decoded.generation);
         let indices = decoded.entries;
 
-        let step = indices
-            .last()
-            .map(|index| index.offset as u64 + index.aligned() as u64)
-            .unwrap_or(self.block.size() as u64);
+        // A checksum authenticates bytes, not their structure. Validate the
+        // entire blob before publishing even its first recovered address.
+        let Some(step) = self.checked_step(&indices) else {
+            self.finished = true;
+            tracing::trace!(
+                block_id = self.block.id(),
+                "[block blob scanner]: invalid addresses, skip remaining block"
+            );
+            return Ok(None);
+        };
 
         tracing::trace!(
             block = self.block.id(),
@@ -111,7 +125,7 @@ impl BlockScanner {
                 hash: index.hash,
                 addr: EntryAddress {
                     block: self.block.id(),
-                    offset: self.offset as u32 + index.offset,
+                    offset: u32::try_from(self.offset + u64::from(index.offset)).expect("validated blob entry address"),
                     len: index.len,
                     sequence: index.sequence,
                 },
@@ -122,6 +136,34 @@ impl BlockScanner {
         self.offset += step;
 
         Ok(Some(infos))
+    }
+
+    fn checked_step(&self, indices: &[BlobEntryIndex]) -> Option<u64> {
+        if indices.is_empty() {
+            return None;
+        }
+        let remaining = (self.block.size() as u64).checked_sub(self.offset)?;
+        let mut end = self.blob_index_size as u64;
+        for index in indices {
+            let start = u64::from(index.offset);
+            let len = u64::from(index.len);
+            // Splitter packs entries contiguously after the index, including
+            // entries appended by a partial blob update. Gaps are not a layout
+            // variant: accepting one could hide a missing or damaged record.
+            if start % PAGE as u64 != 0 || start != end || len < EntryHeader::serialized_len() as u64 {
+                return None;
+            }
+            // Widen before rounding so page alignment cannot wrap, and bound
+            // the complete padded record by this blob's remaining partition.
+            let aligned = len.checked_add(PAGE as u64 - 1)? / PAGE as u64 * PAGE as u64;
+            end = start.checked_add(aligned)?;
+            if end > remaining || u32::try_from(self.offset.checked_add(start)?).is_err() {
+                return None;
+            }
+        }
+        // Nonempty entries follow the index and consume at least one page, so
+        // this advances the scan and is bounded by the remaining partition.
+        Some(end)
     }
 }
 

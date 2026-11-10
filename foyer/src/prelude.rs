@@ -42,9 +42,10 @@ pub use crate::{
     storage::{
         AdmitAll, Block, BlockEngineConfig, BlockStatistics, CombinedDeviceBuilder, Compression, Device, DeviceBuilder,
         Engine, EngineBuildContext, EngineConfig, EstimatedSize, EvictionInfo, EvictionPicker, FifoPicker,
-        FileDeviceBuilder, FsDeviceBuilder, InvalidRatioPicker, IoEngine, IoEngineBuildContext, IoEngineConfig,
-        IoHandle, IopsCounter, Load, NoopDeviceBuilder, NoopIoEngine, NoopIoEngineConfig, PartialDeviceBuilder,
-        PieceRef, PsyncIoEngine, PsyncIoEngineConfig, RawFile, RecoverMode, RejectAll, Statistics, StorageFilter,
-        StorageFilterCondition, StorageFilterResult, Store, StoreBuilder, Throttle,
+        FileDeviceBuilder, FsDeviceBuilder, IndexUsage, InvalidRatioPicker, IoEngine, IoEngineBuildContext,
+        IoEngineConfig, IoHandle, IopsCounter, Load, NoopDeviceBuilder, NoopIoEngine, NoopIoEngineConfig,
+        PartialDeviceBuilder, PieceRef, PsyncIoEngine, PsyncIoEngineConfig, RawFile, RecoverMode, RejectAll,
+        Statistics, StorageFilter, StorageFilterCondition, StorageFilterResult, Store, StoreBuilder, SubmissionLimits,
+        Throttle,
     },
 };

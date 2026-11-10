@@ -69,10 +69,6 @@ impl BlobEntryIndex {
             len,
         }
     }
-
-    pub fn aligned(&self) -> usize {
-        bits::align_up(PAGE, self.len as _)
-    }
 }
 
 /// # Format

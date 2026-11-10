@@ -42,14 +42,14 @@ use futures_util::{
 use itertools::Itertools;
 
 use super::{
-    flusher::{Flusher, InvalidStats, Submission},
+    flusher::{Flusher, FundedSubmission, InvalidStats, Submission, SubmissionLimits},
     indexer::Indexer,
     recover::RecoverRunner,
 };
 #[cfg(any(test, feature = "test_utils"))]
 use crate::test_utils::*;
 use crate::{
-    Device, Load, RejectAll, Statistics, StorageFilter, StorageFilterResult,
+    Device, Load, RecoverMode, RejectAll, Statistics, StorageFilter, StorageFilterResult,
     compress::Compression,
     engine::{
         Engine, EngineBuildContext, EngineConfig, Populated,
@@ -89,6 +89,11 @@ where
     block_size: usize,
     compression: Compression,
     indexer_shards: usize,
+    index_capacity: Option<std::num::NonZeroUsize>,
+    index_usage: super::indexer::IndexUsage,
+    recovery_scratch_limit: Option<std::num::NonZeroUsize>,
+    read_limits: Option<(std::num::NonZeroUsize, Compression)>,
+    submission_limits: Option<SubmissionLimits>,
     recover_concurrency: usize,
     flushers: usize,
     reclaimers: usize,
@@ -119,6 +124,8 @@ where
             .field("block_size", &self.block_size)
             .field("compression", &self.compression)
             .field("indexer_shards", &self.indexer_shards)
+            .field("index_capacity", &self.index_capacity)
+            .field("recovery_scratch_limit", &self.recovery_scratch_limit)
             .field("recover_concurrency", &self.recover_concurrency)
             .field("flushers", &self.flushers)
             .field("reclaimers", &self.reclaimers)
@@ -147,6 +154,11 @@ where
             block_size: 16 * 1024 * 1024, // 16 MiB
             compression: Compression::default(),
             indexer_shards: 64,
+            index_capacity: None,
+            index_usage: super::indexer::IndexUsage::default(),
+            recovery_scratch_limit: None,
+            read_limits: None,
+            submission_limits: None,
             recover_concurrency: 8,
             flushers: 1,
             reclaimers: 1,
@@ -184,6 +196,75 @@ where
     /// Default: `64`.
     pub fn with_indexer_shards(mut self, indexer_shards: usize) -> Self {
         self.indexer_shards = indexer_shards;
+        self
+    }
+
+    /// Limit retained index slots, including pending updates and tombstones.
+    ///
+    /// Opt-in active metadata-pressure eviction uses bounded CLOCK second chances.
+    /// Only verified loads or explicit storage touches set reference bits; admission,
+    /// recovery and maintenance do not. At most 64 slots are inspected per admission;
+    /// an all-hot sweep can reject optional insertion instead of unbounded work.
+    /// Recovery chooses newest sequences without restoring approximate recency.
+    /// Each slot owns a hash-map node AND a CLOCK-order node; fund both, plus hash
+    /// capacity/allocator overhead. Hash capacity is reserved up front. This is not a byte or RSS limit. Queue/keeper,
+    /// decode, flush-buffer and region-manager memory require separate budgets.
+    /// In particular this does not cap the keeper or pending tombstone submission queue.
+    /// A caller's bounded job/byte admission must fund those owners separately.
+    /// Delayed older completions cannot resurrect a metadata-evicted slot.
+    /// Mutable persistent keys still require `with_tombstone_log(true)`; otherwise
+    /// only immutable keys or `RecoverMode::None` have the existing recovery contract.
+    /// Bounded streaming recovery with the current tombstone-log format requires
+    /// exactly one flusher, so its sequence-based append cursor remains ordered.
+    /// Default: unbounded sharded index, preserving the existing behavior.
+    pub fn with_index_capacity(mut self, entries: std::num::NonZeroUsize) -> Self {
+        self.index_capacity = Some(entries);
+        self
+    }
+
+    /// Read-only occupied-slot counter for the opt-in bounded index.
+    ///
+    /// Clone this handle before moving the configuration into a builder. Pending
+    /// updates and tombstones consume slots too. Unbounded mode does not update it.
+    pub fn index_usage(&self) -> super::indexer::IndexUsage {
+        self.index_usage.clone()
+    }
+
+    /// Bound recovery scratch independently of disk bytes and live-index capacity.
+    ///
+    /// Uses sequential, per-blob streaming recovery; no all-record scan inventory.
+    /// The guard conservatively funds eight blob-index pages, region-id vectors,
+    /// and (if enabled) two page buffers for the streaming tombstone-log reader.
+    /// Insufficient budgets fail before opening the log or starting recovery, never
+    /// clear storage or publish a partial engine. Does not include the live index,
+    /// region manager, I/O runtime, or allocator overhead, which need their own budget.
+    /// Default: legacy recovery. Bounded index mode also selects streaming recovery.
+    pub fn with_recovery_scratch_limit(mut self, bytes: std::num::NonZeroUsize) -> Self {
+        self.recovery_scratch_limit = Some(bytes);
+        self
+    }
+
+    /// Restrict disk loads before allocating their page-aligned serialized buffer.
+    /// The byte cap includes the entry header, key and encoded value, before page
+    /// rounding. Only the specified compression is decoded; use `None` to avoid
+    /// constructing any decompressor from recovered/corrupt headers. Decoded key
+    /// and value allocations must still be bounded by their `Code` implementations.
+    /// By default loads retain the existing unrestricted behavior.
+    pub fn with_read_limits(mut self, max_record_len: std::num::NonZeroUsize, compression: Compression) -> Self {
+        self.read_limits = Some((max_record_len, compression));
+        self
+    }
+
+    /// Hard nonblocking aggregate bytes/items for queued and active flusher work,
+    /// including invalidations and raw reinsertion reads. Requires a bounded
+    /// index and the existing ordered tombstone log. Mutations must use the
+    /// fallible Store APIs; legacy void enqueue/delete panic in guarded mode.
+    /// Admission rejection leaves the old mapping untouched. Recovery never
+    /// resets the device merely because a session ended with work outstanding.
+    /// Guarded stores bypass pending keeper copies: a read can miss until its
+    /// serialized payload is published, even if that write is already enqueued.
+    pub fn with_submission_limits(mut self, limits: SubmissionLimits) -> Self {
+        self.submission_limits = Some(limits);
         self
     }
 
@@ -334,16 +415,60 @@ where
             recover_mode,
         }: EngineBuildContext,
     ) -> Result<Arc<BlockEngine<K, V, P>>> {
+        if self.submission_limits.is_some() && recover_mode != RecoverMode::Strict {
+            return Err(Error::new(
+                ErrorKind::Config,
+                "guarded persistence requires strict recovery; unsafe inventory must return an error",
+            ));
+        }
+        if self.submission_limits.is_some() && (self.index_capacity.is_none() || !self.enable_tombstone_log) {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                "submission limits require bounded index and tombstone log",
+            ));
+        }
+        if (self.index_capacity.is_some() || self.recovery_scratch_limit.is_some())
+            && self.enable_tombstone_log
+            && self.flushers != 1
+        {
+            // The existing log has no physical append-generation field. Its
+            // sequence-based reopen cursor is safe only for ordered appends;
+            // independent flushers can append completed batches out of order.
+            // Do not silently claim mutable recovery safety for that configuration.
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                "streaming tombstone recovery requires exactly one flusher",
+            ));
+        }
+        if let Some(limit) = self.recovery_scratch_limit {
+            let required = self
+                .blob_index_size
+                .saturating_mul(8)
+                .saturating_add((self.device.capacity() / self.block_size).saturating_mul(16))
+                .saturating_add(if self.enable_tombstone_log { 2 * PAGE } else { 0 });
+            if required > limit.get() {
+                return Err(
+                    Error::new(ErrorKind::OutOfRange, "recovery scratch budget is insufficient")
+                        .with_context("required_bytes", required.to_string()),
+                );
+            }
+        }
         let io_engine = io_engine_config
             .build(IoEngineBuildContext {
                 spawner: runtime.clone(),
             })
             .await?;
         let io_engine = MonitoredIoEngine::new(io_engine, metrics.clone());
+        if let Some(limits) = &self.submission_limits {
+            limits.start()?;
+        }
         let device = self.device;
         let block_size = self.block_size;
 
+        let streaming = self.index_capacity.is_some() || self.recovery_scratch_limit.is_some();
+        let indexer = Indexer::new(self.indexer_shards).with_capacity(self.index_capacity, self.index_usage);
         let mut tombstones = vec![];
+        let mut latest_tombstone_sequence = 0;
 
         let tombstone_log = if self.enable_tombstone_log {
             // TODO(MrCroxx): The tombstone log support multiples partitions for multiple device support.
@@ -359,18 +484,45 @@ where
             let partition = device.create_partition(pages * PAGE)?;
             partitions.push(partition);
 
-            let tombstone_log = TombstoneLog::open(partitions, io_engine.clone(), &mut tombstones).await?;
+            let tombstone_log = if streaming {
+                TombstoneLog::open_with_visitor(partitions, io_engine.clone(), |tombstone| {
+                    latest_tombstone_sequence = latest_tombstone_sequence.max(tombstone.sequence);
+                    if recover_mode != RecoverMode::None {
+                        indexer.insert_tombstone(tombstone.hash, tombstone.sequence);
+                    }
+                })
+                .await?
+            } else {
+                TombstoneLog::open(partitions, io_engine.clone(), &mut tombstones).await?
+            };
             Some(tombstone_log)
         } else {
             None
         };
 
-        let indexer = Indexer::new(self.indexer_shards);
+        if let Some(log) = &tombstone_log {
+            let floor = log.recovery_floor();
+            indexer.set_recovery_floor(floor);
+            latest_tombstone_sequence = latest_tombstone_sequence.max(floor);
+        }
+
         let submit_queue_size = Arc::<AtomicUsize>::default();
 
         #[expect(clippy::type_complexity)]
-        let (flushers, rxs): (Vec<Flusher<K, V, P>>, Vec<UnboundedReceiver<Submission<K, V, P>>>) = (0..self.flushers)
-            .map(|id| Flusher::<K, V, P>::new(id, submit_queue_size.clone(), metrics.clone()))
+        let (flushers, rxs): (Vec<Flusher<K, V, P>>, Vec<UnboundedReceiver<FundedSubmission<K, V, P>>>) = (0..self
+            .flushers)
+            .map(|id| {
+                Flusher::<K, V, P>::new(
+                    id,
+                    submit_queue_size.clone(),
+                    metrics.clone(),
+                    self.submission_limits.clone(),
+                    self.read_limits
+                        .map_or(self.block_size - self.blob_index_size, |(limit, _)| {
+                            limit.get().min(self.block_size - self.blob_index_size)
+                        }),
+                )
+            })
             .unzip();
 
         let reclaimer = Reclaimer::new(
@@ -416,6 +568,8 @@ where
             &tombstones,
             runtime.clone(),
             metrics.clone(),
+            streaming,
+            latest_tombstone_sequence,
         )
         .await?;
 
@@ -448,6 +602,8 @@ where
             flushers,
             submit_queue_size,
             submit_queue_size_threshold: self.submit_queue_size_threshold,
+            read_limits: self.read_limits,
+            submission_limits: self.submission_limits,
             sequence,
             _spawner: runtime,
             lifecycle: Mutex::new(Lifecycle {
@@ -529,6 +685,9 @@ where
     submit_queue_size: Arc<AtomicUsize>,
     submit_queue_size_threshold: usize,
 
+    read_limits: Option<(std::num::NonZeroUsize, Compression)>,
+    submission_limits: Option<SubmissionLimits>,
+
     sequence: AtomicSequence,
 
     _spawner: Spawner,
@@ -577,6 +736,7 @@ where
         async move {
             join_all(flushers.iter().map(|flusher| flusher.wait())).await;
             block_manager.wait_reclaim().await;
+            join_all(flushers.iter().map(|flusher| flusher.wait())).await;
         }
     }
 
@@ -604,10 +764,13 @@ where
                 // Join every worker even if one fails; returning early would
                 // release the caller while another worker still owns buffers.
                 let results = join_all(workers).await;
-                drop(this);
                 for result in results {
                     result??;
                 }
+                if let Some(limits) = this.inner.submission_limits.clone() {
+                    limits.finish()?;
+                }
+                drop(this);
                 Ok(())
             });
             lifecycle.close = Some(
@@ -627,8 +790,18 @@ where
 
     #[cfg_attr(feature = "tracing", trace(name = "foyer::storage::engine::block::engine::enqueue"))]
     fn enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) {
+        assert!(
+            self.inner.submission_limits.is_none(),
+            "guarded engine requires try_enqueue"
+        );
         let lifecycle = self.inner.lifecycle.lock().unwrap();
-        if !lifecycle.active {
+        if !lifecycle.active
+            || self
+                .inner
+                .submission_limits
+                .as_ref()
+                .is_some_and(SubmissionLimits::is_poisoned)
+        {
             tracing::warn!("cannot enqueue new entry after closed");
             return;
         }
@@ -647,12 +820,42 @@ where
             }
         }
 
+        let pending = if self.inner.indexer.is_bounded() {
+            // Publish a durable invalidation even when the optional payload is
+            // later dropped by either channel OR serialized-buffer pressure.
+            // Its lower sequence does not invalidate a successfully written value.
+            let invalidation = self.inner.sequence.fetch_add(2, Ordering::Relaxed);
+            let sequence = invalidation + 1;
+            let old = self.inner.indexer.reserve(piece.hash(), sequence);
+            self.inner.flushers[piece.hash() as usize % self.inner.flushers.len()].submit(Submission::Tombstone {
+                tombstone: Tombstone {
+                    hash: piece.hash(),
+                    sequence: invalidation,
+                },
+                stats: old.map(|addr| InvalidStats {
+                    block: addr.block,
+                    size: bits::align_up(PAGE, addr.len as usize),
+                }),
+            });
+            if !self.inner.indexer.has_sequence(piece.hash(), sequence) {
+                self.inner.metrics.storage_block_engine_enqueue_skip.increase(1);
+                return;
+            }
+            Some(sequence)
+        } else {
+            None
+        };
+
         if self.inner.submit_queue_size.load(Ordering::Relaxed) > self.inner.submit_queue_size_threshold {
             self.inner.metrics.storage_queue_channel_overflow.increase(1);
             return;
         }
 
-        let sequence = self.inner.sequence.fetch_add(1, Ordering::Relaxed);
+        let sequence = if let Some(sequence) = pending {
+            sequence
+        } else {
+            self.inner.sequence.fetch_add(1, Ordering::Relaxed)
+        };
 
         self.inner.flushers[piece.hash() as usize % self.inner.flushers.len()].submit(Submission::CacheEntry {
             piece,
@@ -670,10 +873,16 @@ where
         let indexer = self.inner.indexer.clone();
         let metrics = self.inner.metrics.clone();
         let block_manager = self.inner.block_manager.clone();
+        let read_limits = self.inner.read_limits;
+        let submission_limits = self.inner.submission_limits.clone();
 
         let load = async move {
             #[cfg(any(test, feature = "test_utils"))]
             load_holer.await;
+
+            if submission_limits.as_ref().is_some_and(SubmissionLimits::is_poisoned) {
+                return Ok(Load::Miss);
+            }
 
             let addr = match indexer.get(hash) {
                 Some(addr) => addr,
@@ -683,6 +892,10 @@ where
             };
 
             tracing::trace!(hash, ?addr, "[block engine]: load");
+
+            if read_limits.is_some_and(|(limit, _)| addr.len as usize > limit.get()) {
+                return Ok(Load::Miss);
+            }
 
             let block = block_manager.block(addr.block);
             if block.partition().statistics().is_read_throttled() {
@@ -725,6 +938,9 @@ where
             };
 
             let (key, value) = {
+                if read_limits.is_some_and(|(_, allowed)| header.compression != allowed) {
+                    return Ok(Load::Miss);
+                }
                 let now = Instant::now();
                 let res = match EntryDeserializer::deserialize::<K, V>(
                     &buf[EntryHeader::serialized_len()..],
@@ -779,8 +995,18 @@ where
     }
 
     fn delete(&self, hash: u64) {
+        assert!(
+            self.inner.submission_limits.is_none(),
+            "guarded engine requires try_delete"
+        );
         let lifecycle = self.inner.lifecycle.lock().unwrap();
-        if !lifecycle.active {
+        if !lifecycle.active
+            || self
+                .inner
+                .submission_limits
+                .as_ref()
+                .is_some_and(SubmissionLimits::is_poisoned)
+        {
             tracing::warn!("cannot delete entry after closed");
             return;
         }
@@ -810,6 +1036,12 @@ where
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
         let this = self.clone();
         async move {
+            if this.inner.submission_limits.is_some() {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "guarded bulk destroy requires an external cache lifecycle decision",
+                ));
+            }
             {
                 let lifecycle = this.inner.lifecycle.lock().unwrap();
                 if !lifecycle.active {
@@ -865,6 +1097,15 @@ where
     V: StorageValue,
     P: Properties,
 {
+    fn is_poisoned(&self) -> bool {
+        self.inner
+            .submission_limits
+            .as_ref()
+            .is_some_and(SubmissionLimits::is_poisoned)
+    }
+    fn bypass_keeper(&self) -> bool {
+        self.inner.submission_limits.is_some()
+    }
     fn device(&self) -> Option<&Arc<dyn Device>> {
         Some(&self.inner.device)
     }
@@ -883,6 +1124,96 @@ where
         self.enqueue(piece, estimated_size);
     }
 
+    fn try_enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) -> Result<()> {
+        if self.inner.submission_limits.is_none() {
+            self.enqueue(piece, estimated_size);
+            return Ok(());
+        }
+        let lifecycle = self.inner.lifecycle.lock().unwrap();
+        if !lifecycle.active || self.is_poisoned() {
+            return Err(Error::new(ErrorKind::Closed, "guarded session is closed or failed"));
+        }
+        let hash = piece.hash();
+        let flusher = &self.inner.flushers[hash as usize % self.inner.flushers.len()];
+        // Reserve BOTH mandatory invalidation and optional payload before any
+        // sequence/index mutation. NoSpace means the old mapping is unchanged.
+        let tombstone_credit = flusher
+            .reserve(0)
+            .ok_or_else(|| Error::new(ErrorKind::NoSpace, "invalidation admission exhausted"))?;
+        let payload_credit = flusher
+            .reserve_payload()
+            .ok_or_else(|| Error::new(ErrorKind::NoSpace, "payload admission exhausted"))?;
+        let invalidation = self.inner.sequence.fetch_add(2, Ordering::Relaxed);
+        let sequence = invalidation + 1;
+        let old = self.inner.indexer.reserve(hash, sequence);
+        if !flusher.submit_funded(
+            Submission::Tombstone {
+                tombstone: Tombstone {
+                    hash,
+                    sequence: invalidation,
+                },
+                stats: old.map(|addr| InvalidStats {
+                    block: addr.block,
+                    size: bits::align_up(PAGE, addr.len as usize),
+                }),
+            },
+            tombstone_credit,
+        ) {
+            return Err(Error::new(
+                ErrorKind::ChannelClosed,
+                "guarded invalidation worker stopped",
+            ));
+        }
+        if !flusher.submit_funded(
+            Submission::CacheEntry {
+                piece,
+                estimated_size,
+                sequence,
+            },
+            payload_credit,
+        ) {
+            return Err(Error::new(ErrorKind::ChannelClosed, "guarded payload worker stopped"));
+        }
+        Ok(())
+    }
+
+    fn try_delete(&self, hash: u64) -> Result<()> {
+        if self.inner.submission_limits.is_none() {
+            self.delete(hash);
+            return Ok(());
+        }
+        let lifecycle = self.inner.lifecycle.lock().unwrap();
+        if !lifecycle.active || self.is_poisoned() {
+            return Err(Error::new(ErrorKind::Closed, "guarded session is closed or failed"));
+        }
+        let flusher = &self.inner.flushers[hash as usize % self.inner.flushers.len()];
+        let credit = flusher
+            .reserve(0)
+            .ok_or_else(|| Error::new(ErrorKind::NoSpace, "invalidation admission exhausted"))?;
+        let sequence = self.inner.sequence.fetch_add(1, Ordering::Relaxed);
+        let stats = self
+            .inner
+            .indexer
+            .insert_tombstone(hash, sequence)
+            .map(|addr| InvalidStats {
+                block: addr.block,
+                size: bits::align_up(PAGE, addr.len as usize),
+            });
+        if !flusher.submit_funded(
+            Submission::Tombstone {
+                tombstone: Tombstone { hash, sequence },
+                stats,
+            },
+            credit,
+        ) {
+            return Err(Error::new(
+                ErrorKind::ChannelClosed,
+                "guarded invalidation worker stopped",
+            ));
+        }
+        Ok(())
+    }
+
     fn load(&self, hash: u64) -> BoxFuture<'static, Result<Load<K, V, P>>> {
         // TODO(MrCroxx): refactor this.
         self.load(hash).boxed()
@@ -894,6 +1225,10 @@ where
 
     fn may_contains(&self, hash: u64) -> bool {
         self.may_contains(hash)
+    }
+
+    fn touch(&self, hash: u64) -> bool {
+        self.inner.indexer.touch(hash)
     }
 
     fn destroy(&self) -> BoxFuture<'static, Result<()>> {
@@ -962,6 +1297,11 @@ mod tests {
             block_size: 16 * 1024,
             compression: Compression::None,
             indexer_shards: 4,
+            index_capacity: None,
+            index_usage: super::super::indexer::IndexUsage::default(),
+            recovery_scratch_limit: None,
+            read_limits: None,
+            submission_limits: None,
             recover_concurrency: 2,
             flushers: 1,
             reclaimers: 1,
@@ -1004,6 +1344,11 @@ mod tests {
             block_size: 16 * 1024,
             compression: Compression::None,
             indexer_shards: 4,
+            index_capacity: None,
+            index_usage: super::super::indexer::IndexUsage::default(),
+            recovery_scratch_limit: None,
+            read_limits: None,
+            submission_limits: None,
             recover_concurrency: 2,
             flushers: 1,
             reclaimers: 1,

@@ -14,6 +14,10 @@
 
 #[cfg(target_os = "linux")]
 pub use crate::io::engine::uring::{UringIoEngine, UringIoEngineConfig};
+/// Owned mutable buffer accepted by `IoEngine::read` extension implementations.
+pub type IoReadBuffer = Box<dyn crate::io::bytes::IoBufMut>;
+/// Owned immutable buffer accepted by `IoEngine::write` extension implementations.
+pub type IoWriteBuffer = Box<dyn crate::io::bytes::IoBuf>;
 pub use crate::{
     compress::Compression,
     engine::{
@@ -21,6 +25,8 @@ pub use crate::{
         block::{
             engine::BlockEngineConfig,
             eviction::{EvictionInfo, EvictionPicker, FifoPicker, InvalidRatioPicker},
+            flusher::SubmissionLimits,
+            indexer::IndexUsage,
             manager::{Block, BlockStatistics},
         },
     },
@@ -30,7 +36,7 @@ pub use crate::{
     },
     io::{
         device::{
-            Device, DeviceBuilder, RawFile,
+            Device, DeviceBuilder, Partition, RawFile,
             combined::CombinedDeviceBuilder,
             file::FileDeviceBuilder,
             fs::FsDeviceBuilder,

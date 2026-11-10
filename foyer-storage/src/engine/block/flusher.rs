@@ -16,9 +16,10 @@ use std::{
     collections::VecDeque,
     fmt::Debug,
     future::{Future, poll_fn},
+    num::NonZeroUsize,
     sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Poll, ready},
     time::Instant,
@@ -31,7 +32,7 @@ use asyncband::{
 use foyer_common::{
     bits,
     code::{StorageKey, StorageValue},
-    error::{Error, Result},
+    error::{Error, ErrorKind, Result},
     metrics::Metrics,
     properties::Properties,
     spawn::{SpawnHandle, Spawner},
@@ -39,9 +40,10 @@ use foyer_common::{
 use futures_core::future::BoxFuture;
 use futures_util::{
     FutureExt,
-    future::{try_join, try_join_all},
+    future::{Shared, join, join_all},
 };
 use itertools::Itertools;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[cfg(any(test, feature = "test_utils"))]
 use crate::test_utils::*;
@@ -61,6 +63,121 @@ use crate::{
     },
     keeper::PieceRef,
 };
+
+/// Opt-in aggregate queued AND active submission bounds, shared by all flushers
+/// and reclaimers. Bytes cover page-rounded enforced record maxima/raw buffers plus
+/// submission metadata, NOT complete `Code` source backings (externally charged).
+/// The fixed two flusher buffers and index must also be funded separately.
+///
+/// Guarded mutations require the fallible Store APIs. No persistence format or
+/// recovery reset is introduced. Each controller belongs to one engine session.
+#[derive(Debug, Clone)]
+pub struct SubmissionLimits(Arc<SubmissionLimitInner>);
+
+#[derive(Debug)]
+struct SubmissionLimitInner {
+    bytes: Arc<Semaphore>,
+    items: Arc<Semaphore>,
+    max_bytes: usize,
+    max_items: usize,
+    poisoned: AtomicBool,
+    started: AtomicBool,
+}
+
+impl SubmissionLimits {
+    /// Conservative per-item queue/credit/batch metadata allowance. Source
+    /// backing allocations and fixed engine buffers are outside this counter.
+    pub const METADATA_BYTES: usize = 512;
+    /// Create nonblocking limits. Rejection does not accept or mutate a key.
+    pub fn new(bytes: NonZeroUsize, items: NonZeroUsize) -> Result<Self> {
+        if bytes.get() > u32::MAX as usize
+            || bytes.get() > Semaphore::MAX_PERMITS
+            || items.get() > Semaphore::MAX_PERMITS
+        {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                "submission limits exceed semaphore capacity",
+            ));
+        }
+        Ok(Self(Arc::new(SubmissionLimitInner {
+            bytes: Arc::new(Semaphore::new(bytes.get())),
+            items: Arc::new(Semaphore::new(items.get())),
+            max_bytes: bytes.get(),
+            max_items: items.get(),
+            poisoned: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+        })))
+    }
+
+    /// Reserved serialized/raw bytes plus per-submission metadata (not source backings).
+    pub fn bytes(&self) -> usize {
+        self.0.max_bytes - self.0.bytes.available_permits()
+    }
+    /// Queued and active payload/invalidation/reinsertion submissions.
+    pub fn items(&self) -> usize {
+        self.0.max_items - self.0.items.available_permits()
+    }
+    /// An I/O/channel failure disables this session. Admission pressure alone
+    /// never poisons it. No data is erased automatically, including on reopen.
+    pub fn is_poisoned(&self) -> bool {
+        self.0.poisoned.load(Ordering::Acquire)
+    }
+    pub(crate) fn poison(&self) {
+        self.0.poisoned.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn start(&self) -> Result<()> {
+        if self.0.started.swap(true, Ordering::AcqRel) {
+            return Err(Error::new(
+                ErrorKind::OutOfRange,
+                "submission limits instance already used",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(&self) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::new(
+                ErrorKind::Io,
+                "cache submissions failed; completion is not established",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserve(&self, bytes: usize) -> Option<SubmissionCredit> {
+        if self.is_poisoned() {
+            return None;
+        }
+        let bytes = u32::try_from(bytes).ok()?;
+        let item = self.0.items.clone().try_acquire_owned().ok()?;
+        let bytes = self.0.bytes.clone().try_acquire_many_owned(bytes).ok()?;
+        Some(SubmissionCredit {
+            _bytes: Some(bytes),
+            _item: Some(item),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SubmissionCredit {
+    _bytes: Option<OwnedSemaphorePermit>,
+    _item: Option<OwnedSemaphorePermit>,
+}
+
+// Keep channel/control ownership explicit without exposing queue internals.
+#[derive(Debug)]
+pub(crate) struct FundedSubmission<K: StorageKey, V: StorageValue, P: Properties> {
+    submission: Submission<K, V, P>,
+    credit: SubmissionCredit,
+}
+
+#[derive(Debug, Default)]
+struct FenceState {
+    generation: u128,
+    pending: Option<(u128, Shared<BoxFuture<'static, ()>>)>,
+}
 
 pub enum Submission<K, V, P>
 where
@@ -126,8 +243,11 @@ where
     P: Properties,
 {
     id: usize,
-    tx: UnboundedSender<Submission<K, V, P>>,
+    tx: UnboundedSender<FundedSubmission<K, V, P>>,
     submit_queue_size: Arc<AtomicUsize>,
+    limits: Option<SubmissionLimits>,
+    record_limit: usize,
+    fence: Arc<Mutex<FenceState>>,
 
     metrics: Arc<Metrics>,
 }
@@ -143,6 +263,9 @@ where
             id: self.id,
             tx: self.tx.clone(),
             submit_queue_size: self.submit_queue_size.clone(),
+            limits: self.limits.clone(),
+            record_limit: self.record_limit,
+            fence: self.fence.clone(),
             metrics: self.metrics.clone(),
         }
     }
@@ -158,12 +281,17 @@ where
         id: usize,
         submit_queue_size: Arc<AtomicUsize>,
         metrics: Arc<Metrics>,
-    ) -> (Self, UnboundedReceiver<Submission<K, V, P>>) {
+        limits: Option<SubmissionLimits>,
+        record_limit: usize,
+    ) -> (Self, UnboundedReceiver<FundedSubmission<K, V, P>>) {
         let (tx, rx) = asyncband::mpsc::unbounded();
         let this = Self {
             id,
             tx,
             submit_queue_size,
+            limits,
+            record_limit,
+            fence: Arc::new(Mutex::new(FenceState::default())),
             metrics,
         };
         (this, rx)
@@ -172,7 +300,7 @@ where
     #[expect(clippy::too_many_arguments)]
     pub fn run(
         &self,
-        rx: UnboundedReceiver<Submission<K, V, P>>,
+        rx: UnboundedReceiver<FundedSubmission<K, V, P>>,
         block_size: usize,
         io_buffer_size: usize,
         blob_index_size: usize,
@@ -191,7 +319,7 @@ where
         bits::assert_aligned(PAGE, io_buffer_size);
         bits::assert_aligned(PAGE, blob_index_size);
 
-        let max_entry_size = block_size - blob_index_size;
+        let max_entry_size = (block_size - blob_index_size).min(self.record_limit);
 
         let bytes = IoSliceMut::new(io_buffer_size);
         let rotate_buffer = Some(IoSliceMut::new(io_buffer_size));
@@ -224,6 +352,8 @@ where
             current_block_handle,
             max_entry_size,
             stopping: false,
+            credits: vec![],
+            limits: self.limits.clone(),
             #[cfg(any(test, feature = "test_utils"))]
             flush_switch,
         };
@@ -231,25 +361,102 @@ where
         Ok(spawner.spawn(runner.run()))
     }
 
-    pub fn submit(&self, submission: Submission<K, V, P>) {
+    /// Reserve raw reinsertion storage BEFORE its I/O allocation. The caller
+    /// must retain this credit across read completion and transfer it to submit.
+    pub(crate) fn reserve_reinsertion(&self, bytes: usize) -> Option<SubmissionCredit> {
+        if bytes > self.record_limit {
+            return None;
+        }
+        self.reserve(bits::align_up(PAGE, bytes))
+    }
+
+    pub(crate) fn has_limits(&self) -> bool {
+        self.limits.is_some()
+    }
+
+    pub(crate) fn reserve(&self, bytes: usize) -> Option<SubmissionCredit> {
+        match &self.limits {
+            Some(limits) => limits.reserve(bytes.checked_add(SubmissionLimits::METADATA_BYTES)?),
+            None => Some(SubmissionCredit::default()),
+        }
+    }
+
+    pub(crate) fn reserve_payload(&self) -> Option<SubmissionCredit> {
+        self.reserve(bits::align_up(PAGE, self.record_limit))
+    }
+
+    pub fn submit(&self, submission: Submission<K, V, P>) -> bool {
+        let bytes = match &submission {
+            // Charge the enforced record maximum rather than trusting a user's
+            // Code::estimated_size. Both serialized buffers are separately fixed.
+            Submission::CacheEntry { .. } => Some(bits::align_up(PAGE, self.record_limit)),
+            Submission::Tombstone { .. } => Some(0),
+            Submission::Reinsertion { reinsertion } => Some(reinsertion.slice.len()),
+            // Fences carry no payload. Their callers own their wait futures;
+            // reclaimers coalesce them rather than enqueue one per region.
+            Submission::Wait { .. } | Submission::Stop => {
+                return self.submit_funded(submission, SubmissionCredit::default());
+            }
+        };
+        let Some(credit) = bytes.and_then(|bytes| self.reserve(bytes)) else {
+            return false;
+        };
+        self.submit_funded(submission, credit)
+    }
+
+    pub(crate) fn submit_funded(&self, submission: Submission<K, V, P>, credit: SubmissionCredit) -> bool {
+        let mut fence = self.fence.lock().unwrap();
         tracing::trace!(id = self.id, "[block engine flusher]: submit task: {submission:?}");
         if let Submission::CacheEntry { estimated_size, .. } = &submission {
             self.submit_queue_size.fetch_add(*estimated_size, Ordering::Relaxed);
         }
-        if let Err(e) = self.tx.send(submission) {
+        if let Err(e) = self.tx.send(FundedSubmission { submission, credit }) {
+            if let Some(limits) = &self.limits {
+                limits.poison();
+            }
             tracing::error!(
                 id = self.id,
                 "[block engine flusher]: error raised when submitting task, error: {e}"
             );
+            return false;
         }
+        fence.generation += 1;
+        true
     }
 
     pub fn wait(&self) -> impl Future<Output = ()> + Send + 'static {
-        let (tx, rx) = oneshot::channel();
-        self.submit(Submission::Wait { tx });
-        async move {
-            let _ = rx.await;
+        let mut fence = self.fence.lock().unwrap();
+        if let Some((generation, pending)) = &fence.pending
+            && *generation == fence.generation
+        {
+            return pending.clone();
         }
+        let (tx, rx) = oneshot::channel();
+        // One fence per accepted-work generation; cancelled/repeated waiters
+        // share it instead of accumulating an uncharged control-message queue.
+        if self
+            .tx
+            .send(FundedSubmission {
+                submission: Submission::Wait { tx },
+                credit: SubmissionCredit::default(),
+            })
+            .is_err()
+            && let Some(limits) = &self.limits
+        {
+            limits.poison();
+        }
+        let limits = self.limits.clone();
+        let pending = async move {
+            if rx.await.is_err()
+                && let Some(limits) = limits
+            {
+                limits.poison();
+            }
+        }
+        .boxed()
+        .shared();
+        fence.pending = Some((fence.generation, pending.clone()));
+        pending
     }
 }
 
@@ -277,6 +484,7 @@ where
     init: Instant,
     io_slice: IoSlice,
     tombstone_infos: Vec<TombstoneInfo>,
+    credits: Vec<SubmissionCredit>,
 }
 
 struct Runner<K, V, P>
@@ -287,7 +495,7 @@ where
 {
     id: usize,
 
-    rx: Option<UnboundedReceiver<Submission<K, V, P>>>,
+    rx: Option<UnboundedReceiver<FundedSubmission<K, V, P>>>,
 
     // NOTE: writer is always `Some(..)`.
     buffer: Option<Buffer>,
@@ -320,6 +528,8 @@ where
 
     max_entry_size: usize,
     stopping: bool,
+    credits: Vec<SubmissionCredit>,
+    limits: Option<SubmissionLimits>,
 
     #[cfg(any(test, feature = "test_utils"))]
     flush_switch: Switch,
@@ -379,10 +589,11 @@ where
                 let tombstone_infos = std::mem::take(&mut self.tombstone_infos);
                 let waiters = std::mem::take(&mut self.waiters);
                 let piece_refs = std::mem::take(&mut self.piece_refs);
+                let credits = std::mem::take(&mut self.credits);
 
                 let init = self.queue_init.take().unwrap();
 
-                let io_task = self.submit_io_task(batch, piece_refs, tombstone_infos, waiters, init);
+                let io_task = self.submit_io_task(batch, piece_refs, tombstone_infos, waiters, init, credits);
                 self.io_tasks.push_back(io_task);
 
                 let io_buffer = self.rotate_buffer.take().unwrap();
@@ -392,11 +603,11 @@ where
 
             tokio::select! {
                 biased;
-                IoTaskCtx { handle, waiters, init, io_slice, tombstone_infos, piece_refs } = self.next_io_task_finish() => {
+                IoTaskCtx { handle, waiters, init, io_slice, tombstone_infos, piece_refs, credits } = self.next_io_task_finish() => {
                     if let Some(handle) = handle {
                         self.current_block_handle = handle;
                     }
-                    self.handle_io_complete(piece_refs, waiters, tombstone_infos, init);
+                    self.handle_io_complete(piece_refs, waiters, tombstone_infos, init, credits);
                     // `try_into_io_buffer` must return `Some(..)` here.
                     self.rotate_buffer = io_slice.try_into_io_slice_mut();
                 }
@@ -410,7 +621,8 @@ where
         Ok(())
     }
 
-    fn recv(&mut self, submission: Submission<K, V, P>) {
+    fn recv(&mut self, funded: FundedSubmission<K, V, P>) {
+        let FundedSubmission { submission, credit } = funded;
         tracing::trace!(
             id = self.id,
             ?submission,
@@ -442,20 +654,28 @@ where
                 );
                 if enqueued {
                     self.piece_refs.push(piece);
+                    self.credits.push(credit);
                 }
                 report(enqueued);
                 self.submit_queue_size.fetch_sub(estimated_size, Ordering::Relaxed);
             }
 
-            Submission::Tombstone { tombstone, stats } => self.tombstone_infos.push(TombstoneInfo { tombstone, stats }),
+            Submission::Tombstone { tombstone, stats } => {
+                self.tombstone_infos.push(TombstoneInfo { tombstone, stats });
+                self.credits.push(credit);
+            }
             Submission::Reinsertion { reinsertion } => {
                 // Skip reinsertion if the entry is not in the indexer.
                 if self.indexer.get(reinsertion.hash).is_some() {
-                    report(self.buffer.as_mut().unwrap().push_slice(
+                    let written = self.buffer.as_mut().unwrap().push_slice(
                         &reinsertion.slice[..reinsertion.len],
                         reinsertion.hash,
                         reinsertion.sequence,
-                    ));
+                    );
+                    report(written);
+                    if written {
+                        self.credits.push(credit);
+                    }
                 }
             }
             Submission::Wait { tx } => self.waiters.push(tx),
@@ -470,8 +690,10 @@ where
         tombstone_infos: Vec<TombstoneInfo>,
         waiters: Vec<oneshot::Sender<()>>,
         init: Instant,
+        credits: Vec<SubmissionCredit>,
     ) -> BoxFuture<'static, IoTaskCtx<K, V, P>> {
         let id = self.id;
+        let limits = self.limits.clone();
 
         tracing::trace!(
             id,
@@ -501,6 +723,7 @@ where
                 let indexer = self.indexer.clone();
                 let block_manager = self.block_manager.clone();
                 let metrics = self.metrics.clone();
+                let limits = self.limits.clone();
 
                 async move {
                     // Wait for block is clean.
@@ -521,12 +744,16 @@ where
                             bits::assert_aligned(PAGE, len);
 
                             let block = block.clone();
+                            let limits = limits.clone();
                             async move {
                                 if len > 0 {
                                     tracing::trace!(id, block = block.id(), offset, len, "[flusher]: write blob data");
 
                                     let (_, res) = block.write(Box::new(data), offset as _).await;
                                     if let Err(e) = res.as_ref() {
+                                        if let Some(limits) = &limits {
+                                            limits.poison();
+                                        }
                                         tracing::error!(
                                             id,
                                             blob_block_offset,
@@ -543,6 +770,9 @@ where
 
                                     let (_, res) = block.write(Box::new(index), blob_block_offset as _).await;
                                     if let Err(e) = res.as_ref() {
+                                        if let Some(limits) = &limits {
+                                            limits.poison();
+                                        }
                                         tracing::error!(
                                             id,
                                             blob_block_offset,
@@ -566,7 +796,9 @@ where
                             }
                         },
                     );
-                    let infos = try_join_all(tasks).await?;
+                    // Do not return early and release credits while a sibling
+                    // detached I/O operation still owns its buffer.
+                    let infos = join_all(tasks).await.into_iter().collect::<Result<Vec<_>>>()?;
 
                     let mut addrs = Vec::with_capacity(infos.iter().map(|(_, _, indices)| indices.len()).sum());
                     for (block, blob_offset, indices) in infos {
@@ -604,9 +836,18 @@ where
             let block_manager = self.block_manager.clone();
             let tombstone_log = self.tombstone_log.clone();
             let tombstone_infos = tombstone_infos.clone();
+            let limits = self.limits.clone();
             async move {
                 if let Some(log) = tombstone_log {
-                    log.append(tombstone_infos.iter().map(|info| &info.tombstone)).await?;
+                    let result = log
+                        .append(tombstone_infos.iter().map(|info: &TombstoneInfo| &info.tombstone))
+                        .await;
+                    if result.is_err()
+                        && let Some(limits) = &limits
+                    {
+                        limits.poison();
+                    }
+                    result?;
                 }
                 for TombstoneInfo { tombstone: _, stats } in tombstone_infos {
                     if let Some(stats) = stats {
@@ -623,17 +864,30 @@ where
 
         let handle = self
             .spawner
-            .spawn(Box::pin(try_join(try_join_all(futures), future)))
+            .spawn(async move {
+                let (writes, log) = join(join_all(futures), future).await;
+                let result = writes
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
+                    .and_then(|states| log.map(|()| states));
+                // Ownership belongs to actual work, not the join waiter: even
+                // dropping the runner's join future cannot free live credits.
+                (result, credits, piece_refs)
+            })
             .map(move |jres| match jres {
-                Ok(Ok((mut states, ()))) => IoTaskCtx {
+                Ok((Ok(mut states), credits, piece_refs)) => IoTaskCtx {
                     handle: states.pop(),
                     piece_refs,
                     waiters,
                     init,
                     io_slice: bytes,
                     tombstone_infos,
+                    credits,
                 },
-                Ok(Err(e)) => {
+                Ok((Err(e), credits, piece_refs)) => {
+                    if let Some(limits) = &limits {
+                        limits.poison();
+                    }
                     tracing::error!(id, ?e, "[block engine flusher]: io task error");
                     IoTaskCtx {
                         handle: None,
@@ -642,17 +896,22 @@ where
                         init,
                         io_slice: bytes,
                         tombstone_infos,
+                        credits,
                     }
                 }
                 Err(e) => {
+                    if let Some(limits) = &limits {
+                        limits.poison();
+                    }
                     tracing::error!(id, ?e, "[block engine flusher]: join io task error");
                     IoTaskCtx {
                         handle: None,
-                        piece_refs,
+                        piece_refs: vec![],
                         waiters,
                         init,
                         io_slice: bytes,
                         tombstone_infos,
+                        credits: vec![],
                     }
                 }
             });
@@ -666,6 +925,7 @@ where
         waiters: Vec<oneshot::Sender<()>>,
         tombstone_infos: Vec<TombstoneInfo>,
         init: Instant,
+        credits: Vec<SubmissionCredit>,
     ) {
         drop(piece_refs);
 
@@ -674,6 +934,10 @@ where
                 .iter()
                 .map(|info| (info.tombstone.hash, info.tombstone.sequence)),
         );
+
+        // Actual I/O and source/keeper ownership have ended before fence observers
+        // see completion; cancelling a wait/close never releases these credits.
+        drop(credits);
 
         for waiter in waiters {
             let _ = waiter.send(());
