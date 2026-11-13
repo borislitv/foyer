@@ -59,6 +59,8 @@ impl RecoverRunner {
         tombstones: &[Tombstone],
         spawner: Spawner,
         metrics: Arc<Metrics>,
+        streaming: bool,
+        initial_sequence: Sequence,
     ) -> Result<()> {
         let now = Instant::now();
 
@@ -67,8 +69,11 @@ impl RecoverRunner {
                 .iter()
                 .map(|tombstone| tombstone.sequence)
                 .max()
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .max(initial_sequence)
+                .max(indexer.recovery_floor());
             sequence.store(latest_sequence + 1, Ordering::Release);
+            indexer.finish_recovery();
             block_manager.init(&blocks);
 
             let elapsed = now.elapsed();
@@ -82,6 +87,21 @@ impl RecoverRunner {
                 .storage_block_engine_recover_duration
                 .record(elapsed.as_secs_f64());
             return Ok(());
+        }
+
+        if streaming {
+            return Self::stream(
+                recover_mode,
+                blob_index_size,
+                blocks,
+                sequence,
+                indexer,
+                block_manager,
+                tombstones,
+                metrics,
+                initial_sequence,
+            )
+            .await;
         }
 
         // Recover blocks concurrently.
@@ -109,7 +129,7 @@ impl RecoverRunner {
 
         // Install recovered entries into the indexer. The indexer deduplicates by sequence, so recovery does not need
         // an extra global dedup table.
-        let mut latest_sequence = 0;
+        let mut latest_sequence = indexer.recovery_floor();
         let mut tombstone_sequences = HashMap::<u64, Sequence>::with_capacity(tombstones.len());
         for tombstone in tombstones {
             latest_sequence = latest_sequence.max(tombstone.sequence);
@@ -183,6 +203,69 @@ impl RecoverRunner {
 
         Ok(())
     }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn stream(
+        mode: RecoverMode,
+        blob_index_size: usize,
+        blocks: Vec<BlockId>,
+        sequence: &AtomicSequence,
+        indexer: &Indexer,
+        manager: &BlockManager,
+        tombstones: &[Tombstone],
+        metrics: Arc<Metrics>,
+        initial_sequence: Sequence,
+    ) -> Result<()> {
+        let start = Instant::now();
+        let mut latest = initial_sequence.max(indexer.recovery_floor());
+        for tombstone in tombstones {
+            latest = latest.max(tombstone.sequence);
+            indexer.insert_tombstone(tombstone.hash, tombstone.sequence);
+        }
+        let mut clean = Vec::new();
+        let mut scanned = 0;
+        // Preserve physical scan order for equal-sequence reinsertion. Each scanner
+        // returns just one blob vector; nothing retains an all-region entry inventory.
+        // No workers or usable engine exist until ALL scans have succeeded.
+        for id in blocks {
+            let mut scanner = BlockScanner::new(manager.block(id).clone(), blob_index_size);
+            let mut occupied = false;
+            loop {
+                let infos = match scanner.next().await {
+                    Ok(Some(infos)) => infos,
+                    Ok(None) => break,
+                    Err(error) if mode == RecoverMode::Strict => {
+                        return Err(Error::new(ErrorKind::Recover, "failed streaming recovery")
+                            .with_context("block", id.to_string())
+                            .with_source(error));
+                    }
+                    Err(_) => break,
+                };
+                occupied |= !infos.is_empty();
+                scanned += infos.len();
+                let batch = infos
+                    .into_iter()
+                    .map(|EntryInfo { hash, addr }| {
+                        latest = latest.max(addr.sequence);
+                        HashedEntryAddress { hash, address: addr }
+                    })
+                    .collect();
+                indexer.insert_batch(batch);
+            }
+            if !occupied {
+                clean.push(id);
+            }
+        }
+        let live = indexer.compact_and_count();
+        sequence.store(latest + 1, Ordering::Release);
+        indexer.finish_recovery();
+        manager.init(&clean);
+        tracing::info!(scanned, live, "streaming recovery complete");
+        metrics
+            .storage_block_engine_recover_duration
+            .record(start.elapsed().as_secs_f64());
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -194,7 +277,7 @@ impl BlockRecoverRunner {
 
         let id = block.id();
         let mut iter = BlockScanner::new(block, blob_index_size);
-        'recover: loop {
+        loop {
             let r = iter.next().await;
             let infos = match r {
                 Ok(Some(infos)) => infos,
@@ -209,12 +292,7 @@ impl BlockRecoverRunner {
                 }
             };
 
-            for info in infos {
-                if info.addr.sequence < recovered.last().map(|last: &EntryInfo| last.addr.sequence).unwrap_or(0) {
-                    break 'recover;
-                }
-                recovered.push(info);
-            }
+            recovered.extend(infos);
         }
 
         Ok(recovered)

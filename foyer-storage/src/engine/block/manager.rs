@@ -31,7 +31,7 @@ use foyer_common::{
 use futures_core::future::BoxFuture;
 use futures_util::{
     FutureExt,
-    future::{Shared, ready},
+    future::{Shared, join_all},
 };
 use itertools::Itertools;
 use rand::seq::IteratorRandom;
@@ -152,6 +152,8 @@ struct State {
     eviction_pickers: Vec<Box<dyn EvictionPicker>>,
 
     reclaim_waiters: Vec<oneshot::Sender<()>>,
+    reclaim_generation: u64,
+    reclaim_tasks: Vec<Shared<BoxFuture<'static, ()>>>,
 }
 
 #[derive(Debug)]
@@ -218,6 +220,8 @@ impl BlockManager {
             clean_block_waiters: Vec::new(),
             eviction_pickers,
             reclaim_waiters: Vec::new(),
+            reclaim_generation: 0,
+            reclaim_tasks: Vec::new(),
         };
         let inner = Inner {
             blocks,
@@ -306,6 +310,9 @@ impl BlockManager {
                 } else {
                     let (tx, rx) = oneshot::channel();
                     state.clean_block_waiters.push(tx);
+                    // Recovery can leave no clean regions. Waiting alone cannot
+                    // produce a writer completion that would start reclamation.
+                    this.reclaim_if_needed(&mut state);
                     drop(state);
                     rx
                 }
@@ -358,6 +365,7 @@ impl BlockManager {
         state.reclaiming_blocks.remove(&block.id());
         self.inner.metrics.storage_block_engine_block_reclaiming.decrease(1);
         if let Some(waiter) = state.clean_block_waiters.pop() {
+            state.writing_blocks.insert(block.id());
             self.inner.metrics.storage_block_engine_block_writing.increase(1);
             let _ = waiter.send(block);
         } else {
@@ -378,13 +386,26 @@ impl BlockManager {
             && let Some(block) = self.evict(state)
         {
             state.reclaiming_blocks.insert(block.id());
+            state.reclaim_generation += 1;
             self.inner.metrics.storage_block_engine_block_reclaiming.increase(1);
             let block = ReclaimingBlock {
                 block_manager: self.clone(),
                 block,
             };
             let future = self.inner.reclaimer.reclaim(block);
-            self.inner.spawner.spawn(future);
+            // Keep joinable ownership without retaining an unbounded history of
+            // completed reclamation tasks on a long-lived mount.
+            state.reclaim_tasks.retain(|task| task.clone().now_or_never().is_none());
+            let task = self.inner.spawner.spawn(future);
+            state.reclaim_tasks.push(
+                async move {
+                    if let Err(error) = task.await {
+                        tracing::error!(?error, "[block manager]: reclaim task failed");
+                    }
+                }
+                .boxed()
+                .shared(),
+            );
         }
     }
 
@@ -440,15 +461,33 @@ impl BlockManager {
         Some(block)
     }
 
+    pub fn reclaim_generation(&self) -> u64 {
+        self.inner.state.read().unwrap().reclaim_generation
+    }
+
+    pub fn reclaim_is_quiescent(&self, generation: u64) -> bool {
+        let state = self.inner.state.read().unwrap();
+        state.reclaim_generation == generation && state.reclaiming_blocks.is_empty()
+    }
+
     pub fn wait_reclaim(&self) -> BoxFuture<'static, ()> {
         let mut state = self.inner.state.write().unwrap();
-        if state.reclaiming_blocks.is_empty() {
-            return ready(()).boxed();
-        }
-        let (tx, rx) = oneshot::channel();
-        state.reclaim_waiters.push(tx);
+        let rx = if state.reclaiming_blocks.is_empty() {
+            None
+        } else {
+            let (tx, rx) = oneshot::channel();
+            state.reclaim_waiters.push(tx);
+            Some(rx)
+        };
+        let this = self.clone();
         async move {
-            let _ = rx.await;
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+            // The state transition is signalled from ReclaimingBlock::drop.
+            // Join as well: scanner/file owners can live until its task returns.
+            let tasks = this.inner.state.read().unwrap().reclaim_tasks.clone();
+            join_all(tasks).await;
         }
         .boxed()
     }

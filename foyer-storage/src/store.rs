@@ -17,7 +17,7 @@ use std::{any::TypeId, borrow::Cow, fmt::Debug, hash::Hash, sync::Arc, time::Ins
 use equivalent::Equivalent;
 use foyer_common::{
     code::{HashBuilder, StorageKey, StorageValue},
-    error::Result,
+    error::{Error, ErrorKind, Result},
     metrics::Metrics,
     properties::{Age, Properties},
     spawn::Spawner,
@@ -125,7 +125,13 @@ where
     }
 
     /// Push a in-memory cache piece to the disk cache write queue.
+    ///
+    /// Panics for guarded engines: use [`Self::try_enqueue`] to handle rejection.
     pub fn enqueue(&self, piece: Piece<K, V, P>, force: bool) {
+        assert!(!self.inner.engine.bypass_keeper(), "guarded Store requires try_enqueue");
+        if self.inner.engine.is_poisoned() {
+            return;
+        }
         tracing::trace!(hash = piece.hash(), "[store]: enqueue piece");
         let now = Instant::now();
 
@@ -145,16 +151,65 @@ where
             .record(now.elapsed().as_secs_f64());
     }
 
+    /// Attempt admission without waiting. `NoSpace` means no key/index mutation
+    /// was accepted; the caller may skip caching or use its authoritative store.
+    /// `Ok` means queued, NOT published or durable. Use [`Self::wait_guarded`]
+    /// for completion. Channel/I/O errors mean uncertain completion and require
+    /// caller fallback, not a successful mutation receipt.
+    pub fn try_enqueue(&self, piece: Piece<K, V, P>, force: bool) -> Result<()> {
+        let estimated_size = EntrySerializer::estimated_size(piece.key(), piece.value());
+        if !force && !self.filter(piece.hash(), estimated_size).is_admitted() {
+            return Err(Error::new(
+                ErrorKind::NoSpace,
+                "cache admission filter rejected payload",
+            ));
+        }
+        // Guarded reads never consult the keeper. Reuse the supported detached
+        // PieceRef conversion rather than replacing a registration on rejection.
+        let piece = if self.inner.engine.bypass_keeper() {
+            piece.into()
+        } else {
+            self.inner.keeper.insert(piece)
+        };
+        self.inner.engine.try_enqueue(piece, estimated_size)
+    }
+
+    /// Drain admitted work and report guarded session I/O/channel failure. This
+    /// does not promise that optional payloads survived serialization/buffer
+    /// admission, nor fsync/power-fail durability. Cancellation never reports
+    /// success and does not cancel already admitted work.
+    pub async fn wait_guarded(&self) -> Result<()> {
+        if !self.inner.engine.bypass_keeper() {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "completion reporting requires a guarded engine",
+            ));
+        }
+        self.inner.engine.wait().await;
+        if self.inner.engine.is_poisoned() {
+            Err(Error::new(ErrorKind::Io, "guarded cache completion failed"))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Load a cache entry from the disk cache.
     pub async fn load<Q>(&self, key: &Q) -> Result<Load<K, V, P>>
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
+        if self.inner.engine.is_poisoned() {
+            return Ok(Load::Miss);
+        }
         let now = Instant::now();
 
         let hash = self.inner.hasher.hash_one(key);
 
-        if let Some(piece) = self.inner.keeper.get(hash, key) {
+        if let Some(piece) = (!self.inner.engine.bypass_keeper())
+            .then(|| self.inner.keeper.get(hash, key))
+            .flatten()
+        {
+            self.inner.engine.touch(hash);
             tracing::trace!(hash, "[store]: load from keeper");
             return Ok(Load::Piece {
                 piece,
@@ -178,6 +233,10 @@ where
                 value: v,
                 populated: p,
             }) if key.equivalent(&k) => {
+                if self.inner.engine.is_poisoned() {
+                    return Ok(Load::Miss);
+                }
+                self.inner.engine.touch(hash);
                 self.inner.metrics.storage_hit.increase(1);
                 self.inner
                     .metrics
@@ -190,6 +249,10 @@ where
                 })
             }
             Ok(Load::Piece { piece, populated }) if key.equivalent(piece.key()) => {
+                if self.inner.engine.is_poisoned() {
+                    return Ok(Load::Miss);
+                }
+                self.inner.engine.touch(hash);
                 self.inner.metrics.storage_hit.increase(1);
                 self.inner
                     .metrics
@@ -230,10 +293,13 @@ where
     }
 
     /// Delete the cache entry with the given key from the disk cache.
+    ///
+    /// Panics for guarded engines: use [`Self::try_delete`] and handle rejection.
     pub fn delete<'a, Q>(&'a self, key: &'a Q)
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
+        assert!(!self.inner.engine.bypass_keeper(), "guarded Store requires try_delete");
         let now = Instant::now();
 
         let hash = self.inner.hasher.hash_one(key);
@@ -244,6 +310,16 @@ where
             .metrics
             .storage_delete_duration
             .record(now.elapsed().as_secs_f64());
+    }
+
+    /// Reserve invalidation admission before changing the mapping. `NoSpace`
+    /// leaves it unchanged and does not poison the session. `Ok` only means
+    /// admitted; await [`Self::wait_guarded`] before reporting completion.
+    pub fn try_delete<Q>(&self, key: &Q) -> Result<()>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.engine.try_delete(self.inner.hasher.hash_one(key))
     }
 
     /// Check if the disk cache contains a cached entry with the given key.
@@ -257,8 +333,29 @@ where
     where
         Q: Hash + Equivalent<K> + ?Sized,
     {
+        if self.inner.engine.is_poisoned() {
+            return false;
+        }
         let hash = self.inner.hasher.hash_one(key);
-        self.inner.keeper.contains(hash, key) || self.inner.engine.may_contains(hash)
+        (!self.inner.engine.bypass_keeper() && self.inner.keeper.contains(hash, key))
+            || self.inner.engine.may_contains(hash)
+    }
+
+    /// Mark an existing disk-index record as accessed, without I/O or entry creation.
+    ///
+    /// Use for a previously validated L2 identity served by L1. This is an advisory
+    /// hash-index hint, not a full-key membership check: a hash collision can give
+    /// another record a second chance, but cannot authorize or return its bytes.
+    /// Pending/absent records are not created or marked. Successful `load` calls
+    /// touch automatically only after key/payload validation; probes do not.
+    pub fn touch<Q>(&self, key: &Q) -> bool
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        if self.inner.engine.is_poisoned() {
+            return false;
+        }
+        self.inner.engine.touch(self.inner.hasher.hash_one(key))
     }
 
     /// Delete all cached entries of the disk cache.

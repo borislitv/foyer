@@ -183,11 +183,29 @@ where
     /// update these counters for their storage operations without a device.
     fn statistics(&self) -> &Arc<Statistics>;
 
+    /// A failed required invalidation can disable an optional cache session.
+    /// Stores must bypass both the engine and pending keeper copies in that case.
+    fn is_poisoned(&self) -> bool {
+        false
+    }
+
+    /// Engines with guarded invalidation may require reads to observe only
+    /// published disk state, not keeper entries awaiting an invalidation fence.
+    fn bypass_keeper(&self) -> bool {
+        false
+    }
+
     /// Return if the given key can be picked by the disk cache engine.
     fn filter(&self, hash: u64, estimated_size: usize) -> StorageFilterResult;
 
     /// Push a in-memory cache piece to the disk cache write queue.
     fn enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize);
+
+    /// Fallible admission. Guarded engines reserve before accepting a mutation.
+    fn try_enqueue(&self, piece: PieceRef<K, V, P>, estimated_size: usize) -> Result<()> {
+        self.enqueue(piece, estimated_size);
+        Ok(())
+    }
 
     /// Load a cache entry from the disk cache.
     ///
@@ -198,10 +216,23 @@ where
     /// Delete the cache entry with the given key from the disk cache.
     fn delete(&self, hash: u64);
 
+    /// Fallible invalidation admission, not a persistence completion receipt.
+    fn try_delete(&self, hash: u64) -> Result<()> {
+        self.delete(hash);
+        Ok(())
+    }
+
     /// Check if the disk cache contains a cached entry with the given key.
     ///
     /// `contains` may return a false-positive result if there is a hash collision with the given key.
     fn may_contains(&self, hash: u64) -> bool;
+
+    /// Advisory access hint for an existing hash-indexed record, without I/O or insertion.
+    /// Engines without an access-aware index retain the compatible no-op default.
+    /// Hash collisions may warm another record; this never validates or returns data.
+    fn touch(&self, _hash: u64) -> bool {
+        false
+    }
 
     /// Delete all cached entries of the disk cache.
     fn destroy(&self) -> BoxFuture<'static, Result<()>>;

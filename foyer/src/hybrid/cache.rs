@@ -21,7 +21,7 @@ use std::{
     hash::Hash,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, ready},
@@ -42,7 +42,10 @@ use foyer_common::{
 };
 use foyer_memory::{Cache, CacheEntry, FetchTarget, GetOrFetch, Piece, Pipe};
 use foyer_storage::{Load, Populated, Statistics, Store};
-use futures_util::FutureExt as _;
+use futures_util::{
+    FutureExt as _,
+    future::{BoxFuture, Shared},
+};
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 
@@ -283,6 +286,8 @@ impl Default for HybridCacheOptions {
     }
 }
 
+type CloseFuture = Shared<BoxFuture<'static, std::result::Result<(), Arc<Error>>>>;
+
 struct Inner<K, V, S = DefaultHasher>
 where
     K: StorageKey,
@@ -293,7 +298,7 @@ where
     policy: HybridCachePolicy,
     flush_on_close: bool,
     metrics: Arc<Metrics>,
-    closed: Arc<AtomicBool>,
+    close: Mutex<Option<CloseFuture>>,
     memory: Cache<K, V, S, HybridCacheProperties>,
     storage: Store<K, V, S, HybridCacheProperties>,
     #[cfg(feature = "tracing")]
@@ -309,15 +314,10 @@ where
     S: HashBuilder + Debug,
 {
     async fn close_inner(
-        closed: Arc<AtomicBool>,
         memory: Cache<K, V, S, HybridCacheProperties>,
         storage: Store<K, V, S, HybridCacheProperties>,
         flush_on_close: bool,
     ) -> Result<()> {
-        if closed.fetch_or(true, Ordering::Relaxed) {
-            return Ok(());
-        }
-
         let now = Instant::now();
         if flush_on_close {
             let bytes = memory.usage();
@@ -331,14 +331,29 @@ where
         Ok(())
     }
 
+    fn start_close(&self) -> CloseFuture {
+        self.close
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| {
+                // All callers join one independently owned task. Cancelling a close
+                // must not abandon memory flushing or let another close return early.
+                let task = self.storage.spawner().spawn(Self::close_inner(
+                    self.memory.clone(),
+                    self.storage.clone(),
+                    self.flush_on_close,
+                ));
+                async move { task.await.and_then(|result| result).map_err(Arc::new) }
+                    .boxed()
+                    .shared()
+            })
+            .clone()
+    }
+
     async fn close(&self) -> Result<()> {
-        Self::close_inner(
-            self.closed.clone(),
-            self.memory.clone(),
-            self.storage.clone(),
-            self.flush_on_close,
-        )
-        .await
+        self.start_close()
+            .await
+            .map_err(|error| Error::new(ErrorKind::Join, "hybrid cache shutdown failed").with_source(error))
     }
 }
 
@@ -349,14 +364,16 @@ where
     S: HashBuilder + Debug,
 {
     fn drop(&mut self) {
+        // Explicit close already started a task that owns all required resources.
+        // In particular, do not spawn a new owner after a completed close.
+        if self.close.lock().unwrap().is_some() {
+            return;
+        }
         let name = self.name.clone();
-        let closed = self.closed.clone();
-        let memory = self.memory.clone();
-        let storage = self.storage.clone();
-        let flush_on_close = self.flush_on_close;
+        let close = self.start_close();
 
         self.storage.spawner().spawn(async move {
-            if let Err(e) = Self::close_inner(closed, memory, storage, flush_on_close).await {
+            if let Err(e) = close.await {
                 tracing::error!(?name, ?e, "[hybrid]: failed to close hybrid cache");
             }
         });
@@ -451,12 +468,11 @@ where
         };
         #[cfg(feature = "tracing")]
         let tracing = std::sync::atomic::AtomicBool::new(false);
-        let closed = Arc::new(AtomicBool::new(false));
         let inner = Inner {
             name,
             policy,
             flush_on_close,
-            closed,
+            close: Mutex::new(None),
             memory,
             storage,
             metrics,

@@ -19,11 +19,9 @@ use foyer_common::{
     code::{StorageKey, StorageValue},
     error::Result,
     properties::Properties,
-    spawn::Spawner,
 };
 use futures_core::future::BoxFuture;
-use futures_util::{FutureExt, future::join_all};
-use itertools::Itertools;
+use futures_util::FutureExt;
 
 use crate::{
     Statistics, StorageFilter,
@@ -55,7 +53,6 @@ where
     reinsertion_filter: Arc<StorageFilter>,
     blob_index_size: usize,
     statistics: Arc<Statistics>,
-    spawner: Spawner,
 }
 
 impl<K, V, P> Debug for Reclaimer<K, V, P>
@@ -81,7 +78,6 @@ where
         reinsertion_filter: Arc<StorageFilter>,
         blob_index_size: usize,
         statistics: Arc<Statistics>,
-        spawner: Spawner,
     ) -> Self {
         Self {
             indexer,
@@ -89,7 +85,6 @@ where
             reinsertion_filter,
             blob_index_size,
             statistics,
-            spawner,
         }
     }
 }
@@ -105,7 +100,6 @@ where
         let statistics = self.statistics.clone();
         let blob_index_size = self.blob_index_size;
         let flushers = self.flushers.clone();
-        let spawner = self.spawner.clone();
         let indexer = self.indexer.clone();
         async move {
             let id = block.id();
@@ -136,7 +130,15 @@ where
                 };
                 for info in infos {
                     if reinsertion_picker.filter(&statistics, info.hash, info.addr.len as _).is_admitted() {
-                        let buf = IoSliceMut::new(bits::align_up(PAGE, info.addr.len as _));
+                        let flusher = flushers[picked_count % flushers.len()].clone();
+                        let bytes=bits::align_up(PAGE, info.addr.len as usize);
+                        let Some(credit)=flusher.reserve_reinsertion(info.addr.len as usize) else {
+                            // Optional hot copies cannot wait for credits held by
+                            // a flusher that may itself need this reclaimed block.
+                            unpicked.push((info.hash,info.addr.sequence));
+                            continue;
+                        };
+                        let buf = IoSliceMut::new(bytes);
                         let (buf, res) = block.read(Box::new(buf), info.addr.offset as _).await;
                         if let Err(e) = res {
                             tracing::warn!(
@@ -147,15 +149,14 @@ where
                         }
                         let buf = buf.try_into_io_slice_mut().unwrap().into_io_slice();
                         let slice = buf.slice(..bits::align_up(PAGE, info.addr.len as usize));
-                        let flusher = flushers[picked_count % flushers.len()].clone();
-                        flusher.submit(Submission::Reinsertion {
+                        flusher.submit_funded(Submission::Reinsertion {
                             reinsertion: Reinsertion {
                                 hash: info.hash,
                                 len: info.addr.len as usize,
                                 sequence: info.addr.sequence,
                                 slice,
                             },
-                        });
+                        },credit);
                         picked_count += 1;
                     } else {
                         unpicked.push((info.hash, info.addr.sequence));
@@ -165,10 +166,12 @@ where
 
             let unpicked_count = unpicked.len();
 
-            let waits = flushers.iter().map(|flusher| flusher.wait()).collect_vec();
-            spawner.spawn(async move {
-                join_all(waits).await;
-            });
+            // Enqueue flush fences before returning the reclaimed block. Do not
+            // await them here: a flusher may need this very block to progress.
+            // Engine shutdown drains these fences and any reclamation they start.
+            for flusher in &flushers {
+                if !flusher.has_limits() { drop(flusher.wait()); }
+            }
             indexer.remove_batch(unpicked);
 
             if let Err(e) = BlockCleaner::clean(&block).await {
