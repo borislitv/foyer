@@ -153,12 +153,21 @@ impl Device for FileDevice {
     }
 
     fn allocated(&self) -> usize {
-        self.partitions.read().unwrap().iter().map(|p| p.size).sum()
+        // Partitions are append-only and contiguous, so the last end is the total allocation.
+        self.partitions
+            .read()
+            .unwrap()
+            .last()
+            .map(|p| p.offset as usize + p.size)
+            .unwrap_or_default()
     }
 
     fn create_partition(&self, size: usize) -> Result<Arc<dyn Partition>> {
         let mut partitions = self.partitions.write().unwrap();
-        let allocated = partitions.iter().map(|p| p.size).sum::<usize>();
+        let allocated = partitions
+            .last()
+            .map(|p| p.offset as usize + p.size)
+            .unwrap_or_default();
         if allocated + size > self.capacity {
             return Err(Error::no_space(self.capacity, allocated, allocated + size));
         }
